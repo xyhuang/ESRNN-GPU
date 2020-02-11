@@ -8,6 +8,8 @@ from es_rnn.loss_modules import PinballLoss, sMAPE, np_sMAPE
 from utils.logger import Logger
 import pandas as pd
 
+import horovod.torch as hvd
+
 
 class ESRNNTrainer(nn.Module):
     def __init__(self, model, dataloader, run_id, config, ohe_headers):
@@ -16,8 +18,10 @@ class ESRNNTrainer(nn.Module):
         self.config = config
         self.dl = dataloader
         self.ohe_headers = ohe_headers
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config['learning_rate'])
-        # self.optimizer = torch.optim.ASGD(self.model.parameters(), lr=config['learning_rate'])
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=config['learning_rate'])
+        # optimizer = torch.optim.ASGD(self.model.parameters(), lr=config['learning_rate'])
+        self.optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=self.model.named_parameters())
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer,
                                                          step_size=config['lr_anneal_step'],
                                                          gamma=config['lr_anneal_rate'])
@@ -27,7 +31,8 @@ class ESRNNTrainer(nn.Module):
         self.max_epochs = config['num_of_train_epochs']
         self.run_id = str(run_id)
         self.prod_str = 'prod' if config['prod'] else 'dev'
-        self.log = Logger("./logs/train%s%s%s" % (self.config['variable'], self.prod_str, self.run_id))
+        logdir = "./logs/train%s%s%s" % (self.config['variable'], self.prod_str, self.run_id) if hvd.rank() == 0 else "/dev/null"
+        self.log = Logger(logdir)
         self.csv_save_path = None
 
     def train_epochs(self):
@@ -43,19 +48,20 @@ class ESRNNTrainer(nn.Module):
             print("Epoch training seconds: {}".format(train_end_time - train_start_time))
             print("Epoch samples: {}".format(len(self.dl.dataset)))
             self.scheduler.step()
-            if epoch_loss < max_loss:
+            if epoch_loss < max_loss and hvd.rank() == 0:
                 self.save()
             eval_start_time = time.time()
             epoch_val_loss = self.val()
             eval_end_time = time.time()
             total_eval_time += eval_end_time - eval_start_time
             print("Epoch evaluation seconds: {}".format(eval_end_time - eval_start_time))
-            if e == 0:
+            if e == 0 and hvd.rank() == 0:
                 file_path = os.path.join(self.csv_save_path, 'validation_losses.csv')
                 with open(file_path, 'w') as f:
                     f.write('epoch,training_loss,validation_loss\n')
-            with open(file_path, 'a') as f:
-                f.write(','.join([str(e), str(epoch_loss), str(epoch_val_loss)]) + '\n')
+            if hvd.rank() == 0:
+                with open(file_path, 'a') as f:
+                    f.write(','.join([str(e), str(epoch_loss), str(epoch_val_loss)]) + '\n')
         print('Total Mins: %5.2f' % ((time.time()-start_time)/60))
         print("Total training mins: %5.2f" % (total_train_time / 60))
         print("Total evalutation mins: %5.2f" % (total_eval_time / 60))
@@ -71,7 +77,9 @@ class ESRNNTrainer(nn.Module):
             end = time.time()
             print("Batch seconds: {}".format(end - start))
             print("Batch size: {}".format(len(train)))
-            self.log.log_scalar('Iteration time', end - start, batch_num + 1 * (self.epochs + 1))
+            if hvd.rank == 0:
+                self.log.log_scalar('Iteration time', end - start, batch_num + 1 * (self.epochs + 1))
+            break
         epoch_loss = epoch_loss / (batch_num + 1)
         self.epochs += 1
 
@@ -80,8 +88,9 @@ class ESRNNTrainer(nn.Module):
             self.epochs, self.max_epochs, epoch_loss))
         info = {'loss': epoch_loss}
 
-        self.log_values(info)
-        self.log_hists()
+        if hvd.rank() == 0:
+            self.log_values(info)
+            self.log_hists()
 
         return epoch_loss
 
@@ -131,15 +140,16 @@ class ESRNNTrainer(nn.Module):
             results = grouped_results.to_dict()
             results['hold_out_loss'] = float(hold_out_loss.detach().cpu())
 
-            self.log_values(results)
-
-            file_path = os.path.join('.', 'grouped_results', self.run_id, self.prod_str)
-            os.makedirs(file_path, exist_ok=True)
-
+            if hvd.rank() == 0:
+                self.log_values(results)
             print(results)
-            grouped_path = os.path.join(file_path, 'grouped_results-{}.csv'.format(self.epochs))
-            grouped_results.to_csv(grouped_path)
-            self.csv_save_path = file_path
+
+            if hvd.rank() == 0:
+                file_path = os.path.join('.', 'grouped_results', self.run_id, self.prod_str)
+                os.makedirs(file_path, exist_ok=True)
+                grouped_path = os.path.join(file_path, 'grouped_results-{}.csv'.format(self.epochs))
+                grouped_results.to_csv(grouped_path)
+                self.csv_save_path = file_path
 
         return hold_out_loss.detach().cpu().item()
 
